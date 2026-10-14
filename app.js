@@ -26,6 +26,8 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 let boundaryLayer;
 // Map each normalized PIN to its Leaflet layer for fast lookup and zooming.
 let boundariesByPin = new Map();
+// Map each normalized PIN to its office name from the loaded GeoJSON.
+let pinNamesByPin = new Map();
 // Keep the currently selected PINs, with a maximum of two for comparison.
 let selectedPins = [];
 
@@ -64,11 +66,14 @@ function getPin(properties = {}) {
 
 // Find a human-readable post-office or area name from a GeoJSON feature.
 function getPinName(properties = {}) {
+  // Use the canonical field from the bundled GeoJSON when it is available.
+  if (properties.Office_Nam) return String(properties.Office_Nam).trim();
   // Check common property names used by PIN-code datasets.
   const key = Object.keys(properties).find((name) =>
     [
       "officename",
       "office_name",
+      "office_nam",
       "office",
       "post_office",
       "postoffice",
@@ -216,7 +221,7 @@ function renderStripes() {
     // Apply the existing comparison-card styles.
     card.className = "stripe-card";
     // Read the office or area name from the corresponding GeoJSON feature.
-    const name = getPinName(boundariesByPin.get(pin).feature.properties);
+    const name = pinNamesByPin.get(pin) || getPinName(boundariesByPin.get(pin).feature.properties);
     // Add the PIN heading, name, and empty figure container.
     card.innerHTML = `<h3>PIN ${pin}</h3><p class="pin-name">${name}</p><figure></figure>`;
     // Load the corresponding stripe image into the figure.
@@ -281,55 +286,75 @@ document.querySelector("#clear-button").addEventListener("click", () => {
   renderStripes();
 });
 
-// Start loading the PIN boundary GeoJSON asynchronously.
-fetch(DATA_URL)
-  // Convert a successful HTTP response into JSON.
-  .then((response) => {
-    // Treat HTTP errors as failures instead of silently rendering an empty map.
-    if (!response.ok) throw new Error(`Could not load ${DATA_URL} (${response.status})`);
-    // Parse and return the GeoJSON payload.
-    return response.json();
-  })
-  // Build the Leaflet layer after the GeoJSON has been parsed.
-  .then((geojson) => {
-    // Create a Leaflet GeoJSON layer with styles and feature interactions.
-    boundaryLayer = L.geoJSON(geojson, {
-      // Apply the current selection-aware style to each feature.
-      style: styleBoundary,
-      // Configure the behavior of each individual feature layer.
-      onEachFeature: (feature, layer) => {
-        // Read the feature's normalized PIN.
-        const pin = getPin(feature.properties);
-        // Index the layer for manual search and map zooming.
-        if (pin) boundariesByPin.set(pin, layer);
-        // Select the PIN when the boundary is clicked.
-        layer.on("click", () => {
-          // Ignore boundaries without a recognized PIN property.
-          if (!pin) return;
-          // Add the clicked PIN to the comparison.
-          selectPin(pin);
-          // Show a successful selection message.
-          searchStatus.className = "status";
-          searchStatus.textContent = `PIN ${pin} selected.`;
+// Load and parse the large boundary file away from the main browser thread.
+const boundaryWorkerSource = `
+  self.onmessage = async (event) => {
+    try {
+      const response = await fetch(event.data.url);
+      if (!response.ok) throw new Error("Could not load boundary data (" + response.status + ")");
+      const geojson = await response.json();
+      const features = geojson.features || [];
+      const batchSize = 40;
+      for (let index = 0; index < features.length; index += batchSize) {
+        self.postMessage({
+          type: "batch",
+          features: features.slice(index, index + batchSize),
+          loaded: Math.min(index + batchSize, features.length),
+          total: features.length,
         });
-      },
-    // Add the completed boundary layer to the map.
-    }).addTo(map);
-    // Calculate the bounds of all loaded boundaries.
+      }
+      self.postMessage({ type: "complete" });
+    } catch (error) {
+      self.postMessage({ type: "error", message: error.message });
+    }
+  };
+`;
+const boundaryWorkerUrl = URL.createObjectURL(
+  new Blob([boundaryWorkerSource], { type: "application/javascript" }),
+);
+const boundaryWorker = new Worker(boundaryWorkerUrl);
+const boundaryOptions = {
+  style: styleBoundary,
+  onEachFeature: (feature, layer) => {
+    const pin = getPin(feature.properties);
+    if (pin) {
+      boundariesByPin.set(pin, layer);
+      pinNamesByPin.set(pin, getPinName(feature.properties));
+    }
+    layer.on("click", () => {
+      if (!pin) return;
+      selectPin(pin);
+      searchStatus.className = "status";
+      searchStatus.textContent = `PIN ${pin} selected.`;
+    });
+  },
+};
+
+boundaryLayer = L.featureGroup().addTo(map);
+boundaryWorker.onmessage = (event) => {
+  if (event.data.type === "batch") {
+    const batchLayer = L.geoJSON(event.data.features, boundaryOptions);
+    batchLayer.eachLayer((layer) => boundaryLayer.addLayer(layer));
+    mapStatus.textContent = `Loading PIN boundaries… ${event.data.loaded.toLocaleString()} of ${event.data.total.toLocaleString()}`;
+    return;
+  }
+  if (event.data.type === "complete") {
     const bounds = boundaryLayer.getBounds();
-    // Fit the map to the data when valid geometry was loaded.
     if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
-    // Remove the loading message after the boundaries are ready.
+    boundaryWorker.terminate();
+    URL.revokeObjectURL(boundaryWorkerUrl);
     mapStatus.remove();
-  })
-  // Display a visible error when the GeoJSON cannot be loaded.
-  .catch((error) => {
-    // Replace the loading text with an actionable error message.
+    return;
+  }
+  if (event.data.type === "error") {
     mapStatus.className = "map-status status error";
     mapStatus.textContent = "Boundary data could not be loaded. See README.md for the expected file.";
-    // Keep the detailed error in the developer console for diagnosis.
-    console.error(error);
-  });
+    boundaryWorker.terminate();
+    URL.revokeObjectURL(boundaryWorkerUrl);
+    console.error(new Error(event.data.message));
+  }
+};
+boundaryWorker.postMessage({ url: new URL(DATA_URL, window.location.href).href });
 
 // Render the initial empty sidebar state.
 renderSelections();

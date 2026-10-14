@@ -1,2 +1,4 @@
+data/stripes/*.png filter=lfs diff=lfs merge=lfs -text
+data/pincodes.geojson filter=lfs diff=lfs merge=lfs -text
 *.png !text !filter !merge !diff
 *.geojson !text !filter !merge !diff

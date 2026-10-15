@@ -294,11 +294,48 @@ const boundaryWorkerSource = `
       if (!response.ok) throw new Error("Could not load boundary data (" + response.status + ")");
       const geojson = await response.json();
       const features = geojson.features || [];
+      const simplifyRing = (ring, tolerance) => {
+        if (ring.length <= 3) return ring;
+        const toleranceSquared = tolerance * tolerance;
+        const simplified = [ring[0]];
+        let previous = ring[0];
+        for (let index = 1; index < ring.length - 1; index += 1) {
+          const point = ring[index];
+          const deltaX = point[0] - previous[0];
+          const deltaY = point[1] - previous[1];
+          if (deltaX * deltaX + deltaY * deltaY >= toleranceSquared) {
+            simplified.push(point);
+            previous = point;
+          }
+        }
+        simplified.push(ring[ring.length - 1]);
+        return simplified;
+      };
+      const simplifyCoordinates = (coordinates, type, tolerance) => {
+        if (type === "Polygon") return coordinates.map((ring) => simplifyRing(ring, tolerance));
+        if (type === "MultiPolygon") {
+          return coordinates.map((polygon) =>
+            polygon.map((ring) => simplifyRing(ring, tolerance)),
+          );
+        }
+        return coordinates;
+      };
+      const simplifyFeature = (feature) => ({
+        ...feature,
+        geometry: {
+          ...feature.geometry,
+          coordinates: simplifyCoordinates(
+            feature.geometry.coordinates,
+            feature.geometry.type,
+            0.002,
+          ),
+        },
+      });
       const batchSize = 40;
       for (let index = 0; index < features.length; index += batchSize) {
         self.postMessage({
           type: "batch",
-          features: features.slice(index, index + batchSize),
+          features: features.slice(index, index + batchSize).map(simplifyFeature),
           loaded: Math.min(index + batchSize, features.length),
           total: features.length,
         });
@@ -331,19 +368,42 @@ const boundaryOptions = {
 };
 
 boundaryLayer = L.featureGroup().addTo(map);
+const boundaryBatchQueue = [];
+let boundaryRenderScheduled = false;
+const renderNextBoundaryBatch = () => {
+  boundaryRenderScheduled = false;
+  const batch = boundaryBatchQueue.shift();
+  if (!batch) return;
+  const batchLayer = L.geoJSON(batch.features, boundaryOptions);
+  batchLayer.eachLayer((layer) => boundaryLayer.addLayer(layer));
+  if (boundaryBatchQueue.length) {
+    boundaryRenderScheduled = true;
+    requestAnimationFrame(renderNextBoundaryBatch);
+  }
+};
 boundaryWorker.onmessage = (event) => {
   if (event.data.type === "batch") {
-    const batchLayer = L.geoJSON(event.data.features, boundaryOptions);
-    batchLayer.eachLayer((layer) => boundaryLayer.addLayer(layer));
+    boundaryBatchQueue.push(event.data);
+    if (!boundaryRenderScheduled) {
+      boundaryRenderScheduled = true;
+      requestAnimationFrame(renderNextBoundaryBatch);
+    }
     mapStatus.textContent = `Loading PIN boundaries… ${event.data.loaded.toLocaleString()} of ${event.data.total.toLocaleString()}`;
     return;
   }
   if (event.data.type === "complete") {
-    const bounds = boundaryLayer.getBounds();
-    if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
-    boundaryWorker.terminate();
-    URL.revokeObjectURL(boundaryWorkerUrl);
-    mapStatus.remove();
+    const finishLoading = () => {
+      if (boundaryBatchQueue.length || boundaryRenderScheduled) {
+        requestAnimationFrame(finishLoading);
+        return;
+      }
+      const bounds = boundaryLayer.getBounds();
+      if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20] });
+      boundaryWorker.terminate();
+      URL.revokeObjectURL(boundaryWorkerUrl);
+      mapStatus.remove();
+    };
+    finishLoading();
     return;
   }
   if (event.data.type === "error") {
